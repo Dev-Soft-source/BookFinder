@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: my-fastapi-react-app
+    env: python
+    buildCommand: |
+      pip install -r backend/requirements.txt
+      cd frontend && npm install && npm run build && cd ..
+    startCommand: |
+      uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.0
+    plan: free
+    autoDeploy: true
