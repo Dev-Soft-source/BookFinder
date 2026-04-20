@@ -1,23 +1,39 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import axios from 'axios';
 import { API } from '@/App';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { toast } from 'sonner';
-import { Download, ExternalLink, TrendingUp } from 'lucide-react';
-import { RotateCcw } from 'lucide-react';
+import { Download, ExternalLink, TrendingUp, RotateCcw, ChevronLeft, ChevronRight } from 'lucide-react';
 
+const PAGE_SIZE_OPTIONS = [5, 10, 25, 50];
 
 export default function ProfitableFinds() {
   const [finds, setFinds] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
 
   useEffect(() => {
     fetchFinds();
     const interval = setInterval(fetchFinds, 60000);
     return () => clearInterval(interval);
   }, []);
+
+  const totalPages = Math.max(1, Math.ceil(finds.length / pageSize));
+  const safePage = Math.min(currentPage, totalPages);
+
+  const paginatedFinds = useMemo(() => {
+    const start = (safePage - 1) * pageSize;
+    return finds.slice(start, start + pageSize);
+  }, [finds, safePage, pageSize]);
+
+  useEffect(() => {
+    if (currentPage > totalPages) {
+      setCurrentPage(totalPages);
+    }
+  }, [currentPage, totalPages]);
 
   const fetchFinds = async () => {
     try {
@@ -119,7 +135,37 @@ export default function ProfitableFinds() {
         </Card>
       ) : (
         <div className="space-y-4">
-          {finds.map((find) => (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-gray-200 bg-gray-50/80 px-4 py-3">
+            <p className="text-sm text-gray-600">
+              Showing <span className="font-medium text-gray-800">{finds.length}</span> find{finds.length !== 1 ? 's' : ''}
+            </p>
+            <div className="flex flex-wrap items-center gap-3 text-sm">
+              <label className="flex items-center gap-2 text-gray-600">
+                <span>Per page</span>
+                <select
+                  className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-gray-800"
+                  value={pageSize}
+                  onChange={(e) => {
+                    setPageSize(Number(e.target.value));
+                    setCurrentPage(1);
+                  }}
+                  data-testid="profitable-finds-page-size"
+                >
+                  {PAGE_SIZE_OPTIONS.map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <span className="text-gray-500" data-testid="profitable-finds-page-info">
+                Page {safePage} of {totalPages}
+              </span>
+            </div>
+          </div>
+
+          <div className="space-y-4">
+          {paginatedFinds.map((find) => (
             <Card key={find.id} className="shadow-lg hover:shadow-xl transition-shadow" data-testid="profitable-find-item">
               <CardHeader className="pb-3">
                 <div className="flex justify-between items-start">
@@ -183,6 +229,37 @@ export default function ProfitableFinds() {
               </CardContent>
             </Card>
           ))}
+          </div>
+
+          {totalPages > 1 && (
+            <div className="flex items-center justify-between rounded-lg border border-gray-200 bg-gray-50/80 px-4 py-3">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={safePage <= 1}
+                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                data-testid="profitable-finds-prev-page"
+              >
+                <ChevronLeft className="w-4 h-4 mr-1" />
+                Previous
+              </Button>
+              <span className="text-sm text-gray-600">
+                {(safePage - 1) * pageSize + 1}–{Math.min(safePage * pageSize, finds.length)} of {finds.length}
+              </span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={safePage >= totalPages}
+                onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                data-testid="profitable-finds-next-page"
+              >
+                Next
+                <ChevronRight className="w-4 h-4 ml-1" />
+              </Button>
+            </div>
+          )}
         </div>
       )}
     </div>

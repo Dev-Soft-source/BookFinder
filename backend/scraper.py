@@ -9,14 +9,100 @@ import math
 import asyncio
 import os
 import logging
-import requests
 import time
+import sys
+from pathlib import Path
 import random
 import re
+
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Playwright,
+    TimeoutError as AsyncPlaywrightTimeoutError,
+    async_playwright,
+)
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+from backend.openai_image_numbers import (
+    DEFAULT_URL,
+    _human_delay,
+    click_amzn_captcha_verify_button,
+    run_post_load_captcha_and_screenshot,
+)
+
+# Windows + Playwright: ensure subprocess-capable event loop policy.
+# Your traceback shows NotImplementedError in asyncio subprocess transport.
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
 
 logger = logging.getLogger(__name__)
 
 SEARCH_URL = "https://bookfinder.com/isbn/"  # or the exact endpoint you discover
+
+
+def _bookfinder_storage_state_path() -> Path:
+    """Session JSON from sync CAPTCHA; async fetch loads it for the same cookies."""
+    custom = os.environ.get("BOOKFINDER_STORAGE_STATE_PATH")
+    if custom:
+        return Path(custom)
+    return Path(__file__).resolve().parent / ".bookfinder_playwright_storage.json"
+
+
+# Sync CAPTCHA warmup runs in a worker thread (see asyncio.to_thread); guard "once" per process.
+_captcha_warmup_once_done = False
+_captcha_warmup_lock = asyncio.Lock()
+
+# --- Playwright (shared browser for all scrapes) ---
+_pw: Optional[Playwright] = None
+_browser: Optional[Browser] = None
+_browser_lock = asyncio.Lock()
+
+# One async BrowserContext for all ISBN fetches — created from the reCAPTCHA ``storage_state``
+# (first sync session). Closed after a new ``pass_captcha`` so cookies reload from disk.
+_bf_fetch_context: Optional[BrowserContext] = None
+_bf_fetch_context_lock = asyncio.Lock()
+
+
+async def _close_bookfinder_fetch_context() -> None:
+    """Drop cached async context (e.g. after a new CAPTCHA session is saved)."""
+    global _bf_fetch_context
+    async with _bf_fetch_context_lock:
+        if _bf_fetch_context is not None:
+            try:
+                await _bf_fetch_context.close()
+            except Exception:
+                logger.exception("Error closing BookFinder fetch context")
+            _bf_fetch_context = None
+
+
+async def _ensure_browser() -> Browser:
+    global _pw, _browser
+    async with _browser_lock:
+        if _browser is None:
+            _pw = await async_playwright().start()
+            _browser = await _pw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+        return _browser
+
+
+async def shutdown_playwright() -> None:
+    """Close the shared Playwright browser; safe to call multiple times."""
+    global _pw, _browser
+    await _close_bookfinder_fetch_context()
+    async with _browser_lock:
+        if _browser is not None:
+            await _browser.close()
+            _browser = None
+        if _pw is not None:
+            await _pw.stop()
+            _pw = None
+
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -470,6 +556,8 @@ def parse_search_html(html: str, isbn: str, filters: dict) -> Dict[str, Union[fl
     title = buyback.get("title") if isinstance(buyback, dict) else None
     buyback_link = buyback.get("buyback_link") if isinstance(buyback, dict) else None
 
+    print("Title: ", title)
+
     if buyback_price > buy_price: # type: ignore
         is_profitable = True
     else:   
@@ -490,39 +578,199 @@ def parse_search_html(html: str, isbn: str, filters: dict) -> Dict[str, Union[fl
         "is_profitable": is_profitable,
     }
 
+async def _fetch_html_playwright(url: str, *, navigation_timeout_ms: int = 90_000) -> str:
+    """
+    Open ``url`` in Playwright (async). Uses **one shared BrowserContext** built from the
+    reCAPTCHA session file (``storage_state`` written by ``_run_sync_captcha_flow`` on the
+    first CAPTCHA page), so ISBN requests reuse the same cookies as that first page.
+    """
+    browser = await _ensure_browser()
+    global _bf_fetch_context
+
+    async with _bf_fetch_context_lock:
+        if _bf_fetch_context is None:
+            state_path = _bookfinder_storage_state_path()
+            ctx_kwargs: dict = {
+                "user_agent": DEFAULT_HEADERS["User-Agent"],
+                "locale": "en-US",
+                "viewport": {"width": 1365, "height": 900},
+                "extra_http_headers": {
+                    "Accept-Language": DEFAULT_HEADERS.get("Accept-Language", "en-US,en;q=0.9"),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+            }
+            if state_path.is_file():
+                ctx_kwargs["storage_state"] = str(state_path)
+                logger.info("Async context from reCAPTCHA storage: %s", state_path)
+            else:
+                logger.warning(
+                    "No storage file at %s — fetch may hit reCAPTCHA again. Run pass_captcha first.",
+                    state_path,
+                )
+            _bf_fetch_context = await browser.new_context(**ctx_kwargs)
+        context = _bf_fetch_context
+
+    page = await context.new_page()
+
+    try:
+        response = await page.goto(url, wait_until="load", timeout=navigation_timeout_ms)
+        if response is not None and response.status >= 400:
+            logger.warning("HTTP %s for %s", response.status, url)
+
+        ready_selector = (
+            "[data-csa-c-offerstype], "
+            '[data-csa-c-clickouttype="buyback"], '
+            "[data-csa-c-condition], "
+            "h1"
+        )
+        try:
+            await page.wait_for_selector(ready_selector, timeout=45_000)
+        except AsyncPlaywrightTimeoutError:
+            logger.warning("Selectors not ready; returning HTML anyway: %s", url)
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15_000)
+        except AsyncPlaywrightTimeoutError:
+            pass
+
+        await asyncio.sleep(1.5)
+        html = await page.content()
+        # if len(html) < 800:
+        #     logger.warning("Very short HTML (%s chars) for %s", len(html), url)
+        return html
+    finally:
+        await page.close()
+
+
+def _run_sync_captcha_flow( start_url: str, *, headless: bool, interactive_prompt: bool,) -> None:
+    """
+    Sync Playwright + openai_image_numbers. Must run in a worker thread (asyncio.to_thread),
+    not on FastAPI's asyncio loop.
+
+    The visible Chromium window **closes when this function returns**: cookies are already
+    written to disk (``storage_state``); keeping the GUI open would block the server. ISBN
+    scraping then uses a **separate headless** async browser that loads that same session
+    from the file (no second visible window unless you change ``HEADLESS`` for async too).
+
+    Env ``BOOKFINDER_CAPTCHA_PAUSE_SECONDS`` (e.g. ``5``): seconds to wait before closing the
+    CAPTCHA window so you can inspect the page after solve.
+    """
+    launch_args: list[str] = [] if headless else ["--start-maximized"]
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless, args=launch_args)
+        context = browser.new_context(no_viewport=True)
+        page = context.new_page()
+        try:
+            logger.info("reCAPTCHA: first page GET %s", start_url)
+            page.goto(start_url, wait_until="load")
+            _human_delay(1.0, 2.0)
+            try:
+                click_amzn_captcha_verify_button(page)
+            except PlaywrightTimeoutError:
+                logger.info(
+                    "No .amzn-captcha-verify-button within timeout; "
+                    "page may not show that control."
+                )
+            run_post_load_captcha_and_screenshot(page)
+
+            state_path = _bookfinder_storage_state_path()
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            context.storage_state(path=str(state_path))
+            logger.info("Saved reCAPTCHA session for async ISBN fetches: %s", state_path)
+
+            pause_raw = os.environ.get("BOOKFINDER_CAPTCHA_PAUSE_SECONDS", "").strip()
+            if pause_raw:
+                try:
+                    pause_sec = float(pause_raw)
+                    if pause_sec > 0:
+                        logger.info(
+                            "Pausing %.1fs before closing CAPTCHA browser (BOOKFINDER_CAPTCHA_PAUSE_SECONDS)",
+                            pause_sec,
+                        )
+                        time.sleep(pause_sec)
+                except ValueError:
+                    logger.warning("Invalid BOOKFINDER_CAPTCHA_PAUSE_SECONDS=%r", pause_raw)
+
+            if interactive_prompt and not headless:
+                print("Close the browser window or press Enter here to exit.")
+                try:
+                    input()
+                except EOFError:
+                    pass
+        finally:
+            context.close()
+            browser.close()
+
+async def pass_captcha(isbn: Optional[str] = None, *, force: bool = False) -> None:
+    """
+    Solve reCAPTCHA on the first BookFinder page (``SEARCH_URL + isbn`` or ``START_URL``),
+    save ``storage_state`` to disk, then clear the async fetch context so the next
+    ``_fetch_html_playwright`` loads that session.
+    """
+    global _captcha_warmup_once_done
+
+    warmup_mode = os.environ.get("BOOKFINDER_CAPTCHA_WARMUP", "once").lower().strip()
+    if warmup_mode == "never" and not force:
+        return
+
+    if isbn and isbn.strip():
+        load_url = SEARCH_URL + isbn.strip()
+    else:
+        load_url = os.environ.get("START_URL", DEFAULT_URL)
+
+    headless = os.environ.get("HEADLESS", "").lower() in ("1", "true", "yes")
+    interactive_prompt = os.environ.get("CAPTCHA_INTERACTIVE", "").lower() in ("1", "true", "yes")
+
+    should_run = force
+    if not force:
+        if warmup_mode == "always":
+            should_run = True
+        elif warmup_mode == "once":
+            async with _captcha_warmup_lock:
+                if not _captcha_warmup_once_done:
+                    _captcha_warmup_once_done = True
+                    should_run = True
+
+    if not should_run:
+        return
+    try:
+        await asyncio.to_thread( _run_sync_captcha_flow, load_url, headless=headless, interactive_prompt=interactive_prompt, )
+    except Exception:
+        logger.exception("CAPTCHA warmup failed; continuing")
+    finally:
+        await _close_bookfinder_fetch_context()
+
 # Main scraping function with retries and backoff
 async def scrape_bookfinder(isbn: str, filters: dict, *, backoff_base=1.5, max_retries=3) -> dict:
-    """
-    Scrape BookFinder.com for a given ISBN
-    Returns dict with pricing data or None if no profitable opportunity
-    """
-        
+    isbn = isbn.strip()
+    fetch_url = SEARCH_URL + isbn
+    logger.info("Scraping BookFinder URL: %s", fetch_url)
+    attempt = 0
     try:
-        session = requests.Session()
-        attempt = 0
         while attempt <= max_retries:
             try:
-                url = SEARCH_URL + isbn
-                resp = session.get(url, headers=DEFAULT_HEADERS, timeout=20)
-                # await asyncio.sleep(1)
-                if resp.status_code == 200:
-                    return parse_search_html(resp.text, isbn, filters)
-                elif resp.status_code in (429, 503):
-                    # rate-limited or service unavailable: back off
-                    wait = backoff_base ** attempt + random.random()
-                    time.sleep(wait)
-                    attempt += 1
-                else:
-                    # unexpected status
-                    resp.raise_for_status()
-            except requests.RequestException as e:
+                html = await _fetch_html_playwright(fetch_url)
+                # If BookFinder challenge page appears, run CAPTCHA flow on this ISBN URL,
+                # refresh async context, and fetch again using saved storage_state.
+                if "confirm you are human" in html.lower():
+                    logger.info("reCAPTCHA challenge detected for %s; forcing pass_captcha", isbn)
+                    await pass_captcha(isbn, force=True)
+                    await asyncio.sleep(1.0)
+                    html = await _fetch_html_playwright(fetch_url)
+                return await asyncio.to_thread(parse_search_html, html, isbn, filters)
+            except Exception as e:
+                logger.warning(
+                    "Playwright fetch attempt %s for %s failed: %s",
+                    attempt + 1,
+                    isbn,
+                    e,
+                )
                 wait = backoff_base ** attempt + random.random()
-                time.sleep(wait)
+                await asyncio.sleep(wait)
                 attempt += 1
         return {}
-    
     except Exception as e:
-        logger.error(f"Error scraping ISBN {isbn}: {str(e)}")
+        logger.error("Error scraping ISBN %s: %s", isbn, e)
         return {}
     
 # Send email alert function
@@ -536,7 +784,7 @@ async def send_email_alert(recipient: str, finds):
         SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
         SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD')
 
-        print(f"SMTP_SERVER: {SMTP_SERVER}, SMTP_PORT: {SMTP_PORT}, SENDER_EMAIL: {SENDER_EMAIL}")
+        #print(f"SMTP_SERVER: {SMTP_SERVER}, SMTP_PORT: {SMTP_PORT}, SENDER_EMAIL: {SENDER_EMAIL}")
 
         if not all([SMTP_SERVER, SMTP_PORT, SENDER_EMAIL, SENDER_PASSWORD]):
             logger.warning("Missing SMTP configuration")

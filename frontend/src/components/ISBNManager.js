@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import axios from 'axios';
 import { API } from '@/App';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
@@ -7,10 +7,10 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { toast } from 'sonner';
-import { Plus, Trash2, Upload } from 'lucide-react';
+import { Plus, Trash2, Upload, ChevronLeft, ChevronRight, FileSpreadsheet, RotateCcw } from 'lucide-react';
 import { useDropzone } from "react-dropzone";
-import { FileSpreadsheet } from "lucide-react";
-import { RotateCcw } from 'lucide-react';
+
+const PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
 
 export default function ISBNManager() {
   const [isbns, setIsbns] = useState([]);
@@ -20,10 +20,26 @@ export default function ISBNManager() {
   const [showBulk, setShowBulk] = useState(false);
   const [csvFileName, setCsvFileName] = useState(null);
   const [loadingUpload, setLoadingUpload] = useState(false); // New loading state for bulk upload
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
 
   useEffect(() => {
     fetchISBNs();
   }, []);
+
+  const totalPages = Math.max(1, Math.ceil(isbns.length / pageSize));
+  const safePage = Math.min(currentPage, totalPages);
+
+  const paginatedIsbns = useMemo(() => {
+    const start = (safePage - 1) * pageSize;
+    return isbns.slice(start, start + pageSize);
+  }, [isbns, safePage, pageSize]);
+
+  useEffect(() => {
+    if (currentPage > totalPages) {
+      setCurrentPage(totalPages);
+    }
+  }, [currentPage, totalPages]);
 
   const fetchISBNs = async () => {
     try {
@@ -245,16 +261,41 @@ export default function ISBNManager() {
       </div>
 
       <Card className="shadow-lg bg-[#fff8dc]">
-        <CardHeader>
+        <CardHeader className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between space-y-0">
           <CardTitle>ISBN List ({isbns.length})</CardTitle>
+          {isbns.length > 0 && (
+            <div className="flex flex-wrap items-center gap-3 text-sm">
+              <label className="flex items-center gap-2 text-gray-600">
+                <span>Per page</span>
+                <select
+                  className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-gray-800"
+                  value={pageSize}
+                  onChange={(e) => {
+                    setPageSize(Number(e.target.value));
+                    setCurrentPage(1);
+                  }}
+                  data-testid="isbn-page-size"
+                >
+                  {PAGE_SIZE_OPTIONS.map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <span className="text-gray-500" data-testid="isbn-page-info">
+                Page {safePage} of {totalPages}
+              </span>
+            </div>
+          )}
         </CardHeader>
-        <CardContent>
+        <CardContent className="space-y-4">
           <div className="max-h-96 overflow-y-auto">
             {isbns.length === 0 ? (
               <p className="text-center text-gray-500 py-8">No ISBNs added yet</p>
             ) : (
               <div className="space-y-2">
-                {isbns.map((item) => (
+                {paginatedIsbns.map((item) => (
                   <div
                     key={item.id}
                     className="flex items-center justify-between p-3 bg-[#f8e5ce] rounded-lg hover:bg-[#e6cfb4] transition-colors"
@@ -284,6 +325,35 @@ export default function ISBNManager() {
               </div>
             )}
           </div>
+          {isbns.length > 0 && totalPages > 1 && (
+            <div className="flex items-center justify-between border-t border-amber-200/80 pt-4">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={safePage <= 1}
+                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                data-testid="isbn-prev-page"
+              >
+                <ChevronLeft className="w-4 h-4 mr-1" />
+                Previous
+              </Button>
+              <span className="text-sm text-gray-600">
+                {(safePage - 1) * pageSize + 1}–{Math.min(safePage * pageSize, isbns.length)} of {isbns.length}
+              </span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={safePage >= totalPages}
+                onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                data-testid="isbn-next-page"
+              >
+                Next
+                <ChevronRight className="w-4 h-4 ml-1" />
+              </Button>
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>

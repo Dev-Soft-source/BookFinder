@@ -1,5 +1,6 @@
 # main.py
 import os
+import sys
 import uuid
 import csv
 import asyncio
@@ -18,13 +19,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, EmailStr
 from fastapi.staticfiles import StaticFiles
-
+from backend.scraper import scrape_bookfinder, send_email_alert, shutdown_playwright, pass_captcha
 
 from sqlalchemy import (
     Column, String, Float, DateTime, Boolean, select, update, func, or_, desc, delete
 )
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
+
+# Windows + Playwright: force subprocess-capable loop policy before event loops are created.
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
 
 # --- Environment ---
 ROOT_DIR = Path(__file__).parent
@@ -49,12 +57,27 @@ async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False
 csv_list = []
 profitable_list = []
 scraper_status = {"running_loop": False}
+restart_state = {"requested": False}
+
+RECAPTCHA_TITLE_MARKER = "confirm you are human"
 
 # SCRAPER_RUNNING = False
 # SCRAPER_TASK = None
 
 def generate_uuid() -> str:
     return str(uuid.uuid4())
+
+
+def request_server_restart(reason: str) -> None:
+    """
+    Restart the current process once (used for hard captcha recovery).
+    """
+    if restart_state["requested"]:
+        return
+    restart_state["requested"] = True
+    logger.error("Server restart requested: %s", reason)
+    python = sys.executable
+    os.execv(python, [python] + sys.argv)
 
 class UserORM(Base):
     __tablename__ = "users"
@@ -104,6 +127,13 @@ class ScraperLogORM(Base):
     message = Column(String)
     isbn = Column(String, nullable=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class ScraperCheckpointORM(Base):
+    __tablename__ = "scraper_checkpoint"
+    id = Column(String, primary_key=True, default=generate_uuid)
+    state_key = Column(String, unique=True, nullable=False)  # e.g. "isbn_resume"
+    last_isbn = Column(String, nullable=True)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 # --- Pydantic schemas ---
 class Token(BaseModel):
@@ -224,7 +254,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 # --- Scraper import (user must supply scraper.py with these coros) ---
 # scraper.py should expose async def scrape_bookfinder(isbn: str, filters: dict) -> dict
 # and async def send_email_alert(email: str, find: ProfitableFindORM)
-from scraper import scrape_bookfinder, send_email_alert  # keep same contract as before
+
 
 async def scraper_task():
     global csv_list, profitable_list # fix UnboundLocalError
@@ -232,13 +262,34 @@ async def scraper_task():
     try:
         async with async_session() as session:
             q = await session.execute(select(ISBNORM))
-            isbns = q.scalars().all()            
+            isbns = q.scalars().all()
 
             if not isbns:
                 log = ScraperLogORM(log_type="info", message="No ISBN records found in database")
                 session.add(log)
                 await session.commit()
-                return           
+                return
+
+            checkpoint_q = await session.execute(
+                select(ScraperCheckpointORM).where(ScraperCheckpointORM.state_key == "isbn_resume")
+            )
+            checkpoint = checkpoint_q.scalars().first()
+            if not checkpoint:
+                checkpoint = ScraperCheckpointORM(state_key="isbn_resume", last_isbn=None)
+                session.add(checkpoint)
+                await session.commit()
+
+            # Resume from the next ISBN after the last processed one.
+            if checkpoint.last_isbn:
+                last_idx = next(
+                    (idx for idx, item in enumerate(isbns) if item.isbn == checkpoint.last_isbn),
+                    None,
+                )
+                if last_idx is not None and len(isbns) > 1:
+                    isbns = isbns[last_idx + 1:] + isbns[:last_idx + 1]
+
+            await pass_captcha(isbns[0].isbn)
+            await asyncio.sleep(1.0)  # short pause to ensure CAPTCHA state settles
 
             for isbn_item in isbns:
                 if not scraper_status["running_loop"]:
@@ -253,6 +304,14 @@ async def scraper_task():
 
                 try:
                     result = await scrape_bookfinder(isbn_item.isbn, filters)
+
+                    title_text = str(result.get("title") or "").lower()
+                    if RECAPTCHA_TITLE_MARKER in title_text:
+                        warn_msg = f"Captcha page detected for {isbn_item.isbn}; restarting server"
+                        logger.warning(warn_msg)
+                        session.add(ScraperLogORM(log_type="error", message=warn_msg, isbn=isbn_item.isbn))
+                        await session.commit()
+                        request_server_restart(warn_msg)
 
                     # Retry once if both prices are 0
                     if result.get("buy_price", 0) == 0 and result.get("buyback_price", 0) == 0:
@@ -317,6 +376,12 @@ async def scraper_task():
                     error_msg = f"Error scraping {isbn_item.isbn}: {str(e)}"
                     logger.exception(error_msg)
                     session.add(ScraperLogORM(log_type="error", message=error_msg, isbn=isbn_item.isbn))
+                    await session.commit()
+                finally:
+                    # Persist progress after each ISBN so restart resumes from next item.
+                    checkpoint.last_isbn = isbn_item.isbn
+                    checkpoint.updated_at = datetime.now(timezone.utc)
+                    session.add(checkpoint)
                     await session.commit()
 
                 # Add delay between scrapes to avoid rate limits
@@ -686,6 +751,10 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    try:
+        await shutdown_playwright()
+    except Exception:
+        logger.exception("Error closing Playwright")
     try:
         await engine.dispose()
     except Exception:
