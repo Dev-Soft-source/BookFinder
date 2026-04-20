@@ -1,13 +1,23 @@
 # main.py
-import os
 import sys
+import asyncio
+
+# Must run before any code creates an event loop (Windows Selector loop cannot spawn subprocess = Playwright async breaks).
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
+
+import os
+import random
 import uuid
 import csv
-import asyncio
 import logging
 from io import StringIO
 from pathlib import Path
 from typing import List, Optional, Any
+import time
 from datetime import datetime, timezone, timedelta
 from passlib.context import CryptContext
 from jose import jwt, JWTError, ExpiredSignatureError
@@ -26,13 +36,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
-
-# Windows + Playwright: force subprocess-capable loop policy before event loops are created.
-if sys.platform == "win32":
-    try:
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    except Exception:
-        pass
 
 # --- Environment ---
 ROOT_DIR = Path(__file__).parent
@@ -385,7 +388,7 @@ async def scraper_task():
                     await session.commit()
 
                 # Add delay between scrapes to avoid rate limits
-                await asyncio.sleep(1)
+                _human_delay(3.0, 6.0)
             
             # final info log
             info_log = ScraperLogORM(log_type="info", message=f"Completed scraping {len(isbns)} ISBNs")
@@ -398,6 +401,9 @@ async def scraper_task():
             session.add(log)
             await session.commit()
         logger.exception("Scraper main error: %s", e)
+
+def _human_delay(min_seconds: float = 2.0, max_seconds: float = 5.0) -> None:
+    time.sleep(random.uniform(min_seconds, max_seconds))
 
 # --- FastAPI app & router ---
 app = FastAPI()

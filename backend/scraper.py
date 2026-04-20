@@ -31,13 +31,26 @@ from backend.openai_image_numbers import (
     run_post_load_captcha_and_screenshot,
 )
 
-# Windows + Playwright: ensure subprocess-capable event loop policy.
-# Your traceback shows NotImplementedError in asyncio subprocess transport.
+# Windows + Playwright: subprocess-capable loop when this module loads before main (e.g. tests).
 if sys.platform == "win32":
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     except Exception:
         pass
+
+
+def _windows_async_playwright_unsupported() -> bool:
+    """True when the running loop cannot spawn Playwright's driver (e.g. uvicorn --reload)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return not isinstance(loop, asyncio.ProactorEventLoop)
+
+
+_sync_playwright_fallback_logged = False
 
 logger = logging.getLogger(__name__)
 
@@ -578,12 +591,80 @@ def parse_search_html(html: str, isbn: str, filters: dict) -> Dict[str, Union[fl
         "is_profitable": is_profitable,
     }
 
+
+def _fetch_html_playwright_sync(url: str, *, navigation_timeout_ms: int = 90_000) -> str:
+    """Sync Playwright fetch for worker threads when the asyncio loop cannot use subprocess."""
+    state_path = _bookfinder_storage_state_path()
+    ctx_kwargs: dict = {
+        "user_agent": DEFAULT_HEADERS["User-Agent"],
+        "locale": "en-US",
+        "viewport": {"width": 1365, "height": 900},
+        "extra_http_headers": {
+            "Accept-Language": DEFAULT_HEADERS.get("Accept-Language", "en-US,en;q=0.9"),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    }
+    if state_path.is_file():
+        ctx_kwargs["storage_state"] = str(state_path)
+        logger.info("Sync fetch context from reCAPTCHA storage: %s", state_path)
+    else:
+        logger.warning(
+            "No storage file at %s — fetch may hit reCAPTCHA again. Run pass_captcha first.",
+            state_path,
+        )
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(**ctx_kwargs)
+        page = context.new_page()
+        try:
+            response = page.goto(url, wait_until="load", timeout=navigation_timeout_ms)
+            if response is not None and response.status >= 400:
+                logger.warning("HTTP %s for %s", response.status, url)
+            ready_selector = (
+                "[data-csa-c-offerstype], "
+                '[data-csa-c-clickouttype="buyback"], '
+                "[data-csa-c-condition], "
+                "h1"
+            )
+            try:
+                page.wait_for_selector(ready_selector, timeout=45_000)
+            except PlaywrightTimeoutError:
+                logger.warning("Selectors not ready; returning HTML anyway: %s", url)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15_000)
+            except PlaywrightTimeoutError:
+                pass
+            time.sleep(1.5)
+            return page.content()
+        finally:
+            page.close()
+            context.close()
+            browser.close()
+
+
 async def _fetch_html_playwright(url: str, *, navigation_timeout_ms: int = 90_000) -> str:
     """
     Open ``url`` in Playwright (async). Uses **one shared BrowserContext** built from the
     reCAPTCHA session file (``storage_state`` written by ``_run_sync_captcha_flow`` on the
     first CAPTCHA page), so ISBN requests reuse the same cookies as that first page.
     """
+    if _windows_async_playwright_unsupported():
+        global _sync_playwright_fallback_logged
+        if not _sync_playwright_fallback_logged:
+            _sync_playwright_fallback_logged = True
+            logger.warning(
+                "Using sync Playwright in worker threads: this asyncio loop cannot spawn subprocess "
+                "(common with uvicorn --reload on Windows). Run without --reload or use ProactorEventLoop for shared async browser."
+            )
+        return await asyncio.to_thread(
+            _fetch_html_playwright_sync,
+            url,
+            navigation_timeout_ms=navigation_timeout_ms,
+        )
+
     browser = await _ensure_browser()
     global _bf_fetch_context
 
