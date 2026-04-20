@@ -319,7 +319,9 @@ async def scraper_task():
                     # Retry once if both prices are 0
                     if result.get("buy_price", 0) == 0 and result.get("buyback_price", 0) == 0:
                         logger.warning(f"No prices found for {isbn_item.isbn}. Retrying once...")
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(
+                            float(os.environ.get("BOOKFINDER_EMPTY_RETRY_DELAY", "10"))
+                        )
                         result = await scrape_bookfinder(isbn_item.isbn, filters)
                     
                     if result.get("buy_price", 0) == 0:
@@ -387,8 +389,8 @@ async def scraper_task():
                     session.add(checkpoint)
                     await session.commit()
 
-                # Add delay between scrapes to avoid rate limits
-                _human_delay(3.0, 6.0)
+                # Add delay between scrapes to avoid rate limits (shared datacenter IPs need more).
+                _scrape_inter_isbn_delay()
             
             # final info log
             info_log = ScraperLogORM(log_type="info", message=f"Completed scraping {len(isbns)} ISBNs")
@@ -404,6 +406,15 @@ async def scraper_task():
 
 def _human_delay(min_seconds: float = 2.0, max_seconds: float = 5.0) -> None:
     time.sleep(random.uniform(min_seconds, max_seconds))
+
+
+def _scrape_inter_isbn_delay() -> None:
+    """Pause between ISBNs to reduce 429s (tune with BOOKFINDER_SCRAPE_DELAY_MIN / _MAX)."""
+    lo = float(os.environ.get("BOOKFINDER_SCRAPE_DELAY_MIN", "8"))
+    hi = float(os.environ.get("BOOKFINDER_SCRAPE_DELAY_MAX", "22"))
+    if hi < lo:
+        lo, hi = hi, lo
+    _human_delay(lo, hi)
 
 # --- FastAPI app & router ---
 app = FastAPI()
@@ -704,7 +715,9 @@ async def manual_scraper_run(current_user: Any = Depends(get_current_user)):
                 await scraper_task()
             except Exception as e:
                 logger.exception(f"Error in scraper loop: {e}")
-            await asyncio.sleep(10)  # wait 5 seconds between full runs
+            await asyncio.sleep(
+                float(os.environ.get("BOOKFINDER_FULL_LOOP_PAUSE_SECONDS", "30"))
+            )
 
     # Start the loop in the background
     asyncio.create_task(loop_scraper())

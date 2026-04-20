@@ -57,6 +57,31 @@ logger = logging.getLogger(__name__)
 SEARCH_URL = "https://bookfinder.com/isbn/"  # or the exact endpoint you discover
 
 
+class BookFinderRateLimited(Exception):
+    """HTTP 429 from BookFinder — caller should wait before retrying."""
+
+    def __init__(self, message: str, *, retry_after: Optional[float] = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _retry_after_seconds_from_response(response) -> Optional[float]:
+    """Parse ``Retry-After`` as delay in seconds (Playwright sync/async response)."""
+    if response is None:
+        return None
+    try:
+        headers = response.headers
+    except Exception:
+        return None
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except ValueError:
+        return None
+
+
 def _bookfinder_storage_state_path() -> Path:
     """Session JSON from sync CAPTCHA; async fetch loads it for the same cookies."""
     custom = os.environ.get("BOOKFINDER_STORAGE_STATE_PATH")
@@ -569,8 +594,6 @@ def parse_search_html(html: str, isbn: str, filters: dict) -> Dict[str, Union[fl
     title = buyback.get("title") if isinstance(buyback, dict) else None
     buyback_link = buyback.get("buyback_link") if isinstance(buyback, dict) else None
 
-    print("Title: ", title)
-
     if buyback_price > buy_price: # type: ignore
         is_profitable = True
     else:   
@@ -621,6 +644,12 @@ def _fetch_html_playwright_sync(url: str, *, navigation_timeout_ms: int = 90_000
         page = context.new_page()
         try:
             response = page.goto(url, wait_until="load", timeout=navigation_timeout_ms)
+            if response is not None and response.status == 429:
+                ra = _retry_after_seconds_from_response(response)
+                raise BookFinderRateLimited(
+                    f"HTTP 429 Too Many Requests for {url}",
+                    retry_after=ra,
+                )
             if response is not None and response.status >= 400:
                 logger.warning("HTTP %s for %s", response.status, url)
             ready_selector = (
@@ -695,6 +724,12 @@ async def _fetch_html_playwright(url: str, *, navigation_timeout_ms: int = 90_00
 
     try:
         response = await page.goto(url, wait_until="load", timeout=navigation_timeout_ms)
+        if response is not None and response.status == 429:
+            ra = _retry_after_seconds_from_response(response)
+            raise BookFinderRateLimited(
+                f"HTTP 429 Too Many Requests for {url}",
+                retry_after=ra,
+            )
         if response is not None and response.status >= 400:
             logger.warning("HTTP %s for %s", response.status, url)
 
@@ -822,9 +857,19 @@ async def pass_captcha(isbn: Optional[str] = None, *, force: bool = False) -> No
         await _close_bookfinder_fetch_context()
 
 # Main scraping function with retries and backoff
-async def scrape_bookfinder(isbn: str, filters: dict, *, backoff_base=1.5, max_retries=3) -> dict:
+async def scrape_bookfinder(
+    isbn: str,
+    filters: dict,
+    *,
+    backoff_base: float = 1.5,
+    max_retries: Optional[int] = None,
+) -> dict:
     isbn = isbn.strip()
     fetch_url = SEARCH_URL + isbn
+    if max_retries is None:
+        max_retries = int(os.environ.get("BOOKFINDER_MAX_RETRIES", "5"))
+    base_429 = float(os.environ.get("BOOKFINDER_429_BACKOFF_BASE", "20"))
+    cap_429 = float(os.environ.get("BOOKFINDER_429_BACKOFF_MAX", "30"))
     logger.info("Scraping BookFinder URL: %s", fetch_url)
     attempt = 0
     try:
@@ -839,6 +884,19 @@ async def scrape_bookfinder(isbn: str, filters: dict, *, backoff_base=1.5, max_r
                     await asyncio.sleep(1.0)
                     html = await _fetch_html_playwright(fetch_url)
                 return await asyncio.to_thread(parse_search_html, html, isbn, filters)
+            except BookFinderRateLimited as e:
+                ra = e.retry_after
+                wait = (ra if ra is not None and ra > 0 else base_429) + random.uniform(0, 15)
+                wait = max(30.0, min(wait, cap_429))
+                logger.warning(
+                    "HTTP 429 rate limited for %s — sleeping %.0fs before retry (attempt %s/%s)",
+                    isbn,
+                    wait,
+                    attempt + 1,
+                    max_retries + 1,
+                )
+                await asyncio.sleep(wait)
+                attempt += 1
             except Exception as e:
                 logger.warning(
                     "Playwright fetch attempt %s for %s failed: %s",
