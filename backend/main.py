@@ -30,6 +30,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, EmailStr
 from fastapi.staticfiles import StaticFiles
 from backend.scraper import scrape_bookfinder, send_email_alert, shutdown_playwright, pass_captcha
+#from scraper import scrape_bookfinder, send_email_alert, shutdown_playwright, pass_captcha
 
 from sqlalchemy import (
     Column, String, Float, DateTime, Boolean, select, update, func, or_, desc, delete

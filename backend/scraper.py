@@ -615,6 +615,45 @@ def parse_search_html(html: str, isbn: str, filters: dict) -> Dict[str, Union[fl
     }
 
 
+def _post_navigation_waits_sync(page, ready_selector: str) -> None:
+    """Optional ``networkidle`` + fixed pause after main content selectors appear."""
+    try:
+        page.wait_for_selector(ready_selector, timeout=45_000)
+    except PlaywrightTimeoutError:
+        logger.warning("Selectors not ready; returning HTML anyway: %s", page.url)
+    use_idle = os.environ.get("BOOKFINDER_USE_NETWORKIDLE", "1").lower() in ("1", "true", "yes")
+    if use_idle:
+        try:
+            page.wait_for_load_state("networkidle", timeout=15_000)
+        except PlaywrightTimeoutError:
+            pass
+    try:
+        pause = float(os.environ.get("BOOKFINDER_POST_READY_SLEEP_SECONDS", "1.5"))
+    except ValueError:
+        pause = 1.5
+    if pause > 0:
+        time.sleep(pause)
+
+
+async def _post_navigation_waits_async(page, ready_selector: str) -> None:
+    try:
+        await page.wait_for_selector(ready_selector, timeout=45_000)
+    except AsyncPlaywrightTimeoutError:
+        logger.warning("Selectors not ready; returning HTML anyway: %s", page.url)
+    use_idle = os.environ.get("BOOKFINDER_USE_NETWORKIDLE", "1").lower() in ("1", "true", "yes")
+    if use_idle:
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15_000)
+        except AsyncPlaywrightTimeoutError:
+            pass
+    try:
+        pause = float(os.environ.get("BOOKFINDER_POST_READY_SLEEP_SECONDS", "1.5"))
+    except ValueError:
+        pause = 1.5
+    if pause > 0:
+        await asyncio.sleep(pause)
+
+
 def _fetch_html_playwright_sync(url: str, *, navigation_timeout_ms: int = 90_000) -> str:
     """Sync Playwright fetch for worker threads when the asyncio loop cannot use subprocess."""
     state_path = _bookfinder_storage_state_path()
@@ -658,15 +697,7 @@ def _fetch_html_playwright_sync(url: str, *, navigation_timeout_ms: int = 90_000
                 "[data-csa-c-condition], "
                 "h1"
             )
-            try:
-                page.wait_for_selector(ready_selector, timeout=45_000)
-            except PlaywrightTimeoutError:
-                logger.warning("Selectors not ready; returning HTML anyway: %s", url)
-            try:
-                page.wait_for_load_state("networkidle", timeout=15_000)
-            except PlaywrightTimeoutError:
-                pass
-            time.sleep(1.5)
+            _post_navigation_waits_sync(page, ready_selector)
             return page.content()
         finally:
             page.close()
@@ -739,17 +770,7 @@ async def _fetch_html_playwright(url: str, *, navigation_timeout_ms: int = 90_00
             "[data-csa-c-condition], "
             "h1"
         )
-        try:
-            await page.wait_for_selector(ready_selector, timeout=45_000)
-        except AsyncPlaywrightTimeoutError:
-            logger.warning("Selectors not ready; returning HTML anyway: %s", url)
-
-        try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-        except AsyncPlaywrightTimeoutError:
-            pass
-
-        await asyncio.sleep(1.5)
+        await _post_navigation_waits_async(page, ready_selector)
         html = await page.content()
         # if len(html) < 800:
         #     logger.warning("Very short HTML (%s chars) for %s", len(html), url)
