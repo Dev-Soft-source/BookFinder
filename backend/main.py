@@ -308,6 +308,7 @@ async def scraper_task():
 
                 try:
                     result = await scrape_bookfinder(isbn_item.isbn, filters)
+                    _scrape_human_delay()
 
                     title_text = str(result.get("title") or "").lower()
                     if RECAPTCHA_TITLE_MARKER in title_text:
@@ -379,6 +380,7 @@ async def scraper_task():
                         session.add(log)
                         await session.commit()
                 except Exception as e:
+                    _scrape_human_delay()
                     error_msg = f"Error scraping {isbn_item.isbn}: {str(e)}"
                     logger.exception(error_msg)
                     session.add(ScraperLogORM(log_type="error", message=error_msg, isbn=isbn_item.isbn))
@@ -391,7 +393,7 @@ async def scraper_task():
                     await session.commit()
 
                 # Add delay between scrapes to avoid rate limits (shared datacenter IPs need more).
-                _scrape_inter_isbn_delay()
+                
             
             # final info log
             info_log = ScraperLogORM(log_type="info", message=f"Completed scraping {len(isbns)} ISBNs")
@@ -405,17 +407,11 @@ async def scraper_task():
             await session.commit()
         logger.exception("Scraper main error: %s", e)
 
-def _human_delay(min_seconds: float = 2.0, max_seconds: float = 5.0) -> None:
-    time.sleep(random.uniform(min_seconds, max_seconds))
-
-
-def _scrape_inter_isbn_delay() -> None:
+def _scrape_human_delay() -> None:
     """Pause between ISBNs to reduce 429s (tune with BOOKFINDER_SCRAPE_DELAY_MIN / _MAX)."""
-    lo = float(os.environ.get("BOOKFINDER_SCRAPE_DELAY_MIN", "8"))
-    hi = float(os.environ.get("BOOKFINDER_SCRAPE_DELAY_MAX", "22"))
-    if hi < lo:
-        lo, hi = hi, lo
-    _human_delay(lo, hi)
+    lo = float(os.environ.get("BOOKFINDER_SCRAPE_DELAY_MIN", "4"))
+    hi = float(os.environ.get("BOOKFINDER_SCRAPE_DELAY_MAX", "12"))
+    time.sleep(random.uniform(lo, hi))
 
 # --- FastAPI app & router ---
 app = FastAPI()

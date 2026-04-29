@@ -25,6 +25,7 @@ from playwright.async_api import (
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from backend.openai_image_numbers import (
+#from openai_image_numbers import (
     DEFAULT_URL,
     _human_delay,
     click_amzn_captcha_verify_button,
@@ -629,7 +630,7 @@ def _fetch_html_playwright_sync(url: str, *, navigation_timeout_ms: int = 90_000
     }
     if state_path.is_file():
         ctx_kwargs["storage_state"] = str(state_path)
-        logger.info("Sync fetch context from reCAPTCHA storage: %s", state_path)
+        #logger.info("Sync fetch context from reCAPTCHA storage: %s", state_path)
     else:
         logger.warning(
             "No storage file at %s — fetch may hit reCAPTCHA again. Run pass_captcha first.",
@@ -867,9 +868,9 @@ async def scrape_bookfinder(
     isbn = isbn.strip()
     fetch_url = SEARCH_URL + isbn
     if max_retries is None:
-        max_retries = int(os.environ.get("BOOKFINDER_MAX_RETRIES", "5"))
-    base_429 = float(os.environ.get("BOOKFINDER_429_BACKOFF_BASE", "20"))
-    cap_429 = float(os.environ.get("BOOKFINDER_429_BACKOFF_MAX", "30"))
+        max_retries = int(os.environ.get("BOOKFINDER_MAX_RETRIES", "10"))
+    base_429 = float(os.environ.get("BOOKFINDER_429_BACKOFF_BASE", "10"))
+    cap_429 = float(os.environ.get("BOOKFINDER_429_BACKOFF_MAX", "10"))
     logger.info("Scraping BookFinder URL: %s", fetch_url)
     attempt = 0
     try:
@@ -881,13 +882,11 @@ async def scrape_bookfinder(
                 if "confirm you are human" in html.lower():
                     logger.info("reCAPTCHA challenge detected for %s; forcing pass_captcha", isbn)
                     await pass_captcha(isbn, force=True)
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(random.uniform(2.0, 3.5))
                     html = await _fetch_html_playwright(fetch_url)
                 return await asyncio.to_thread(parse_search_html, html, isbn, filters)
             except BookFinderRateLimited as e:
-                ra = e.retry_after
-                wait = (ra if ra is not None and ra > 0 else base_429) + random.uniform(0, 15)
-                wait = max(30.0, min(wait, cap_429))
+                wait = random.uniform(7.0, 14.0)
                 logger.warning(
                     "HTTP 429 rate limited for %s — sleeping %.0fs before retry (attempt %s/%s)",
                     isbn,
@@ -895,7 +894,7 @@ async def scrape_bookfinder(
                     attempt + 1,
                     max_retries + 1,
                 )
-                await asyncio.sleep(wait)
+                time.sleep(wait)
                 attempt += 1
             except Exception as e:
                 logger.warning(
@@ -910,6 +909,8 @@ async def scrape_bookfinder(
         return {}
     except Exception as e:
         logger.error("Error scraping ISBN %s: %s", isbn, e)
+        wait = backoff_base ** attempt + random.random()
+        await asyncio.sleep(wait)
         return {}
     
 # Send email alert function
