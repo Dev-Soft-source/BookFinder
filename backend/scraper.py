@@ -886,7 +886,7 @@ async def scrape_bookfinder(
                     html = await _fetch_html_playwright(fetch_url)
                 return await asyncio.to_thread(parse_search_html, html, isbn, filters)
             except BookFinderRateLimited as e:
-                wait = random.uniform(7.0, 14.0)
+                wait = random.uniform(4.5, 5.8)
                 logger.warning(
                     "HTTP 429 rate limited for %s — sleeping %.0fs before retry (attempt %s/%s)",
                     isbn,

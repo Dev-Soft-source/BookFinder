@@ -409,8 +409,8 @@ async def scraper_task():
 
 def _scrape_human_delay() -> None:
     """Pause between ISBNs to reduce 429s (tune with BOOKFINDER_SCRAPE_DELAY_MIN / _MAX)."""
-    lo = float(os.environ.get("BOOKFINDER_SCRAPE_DELAY_MIN", "4"))
-    hi = float(os.environ.get("BOOKFINDER_SCRAPE_DELAY_MAX", "12"))
+    lo = float(os.environ.get("BOOKFINDER_SCRAPE_DELAY_MIN", "2"))
+    hi = float(os.environ.get("BOOKFINDER_SCRAPE_DELAY_MAX", "5"))
     time.sleep(random.uniform(lo, hi))
 
 # --- FastAPI app & router ---
