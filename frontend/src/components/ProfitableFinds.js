@@ -17,7 +17,7 @@ export default function ProfitableFinds() {
 
   useEffect(() => {
     fetchFinds();
-    const interval = setInterval(fetchFinds, 60000);
+    const interval = setInterval(fetchFinds, 6000000);
     return () => clearInterval(interval);
   }, []);
 

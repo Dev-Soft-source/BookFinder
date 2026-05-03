@@ -14,7 +14,7 @@ export default function Overview() {
 
   useEffect(() => {
     fetchStats();
-    const interval = setInterval(fetchStats, 25000);
+    const interval = setInterval(fetchStats, 2500000);
     return () => clearInterval(interval);
   }, []);
 
