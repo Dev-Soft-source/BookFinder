@@ -125,7 +125,7 @@ async def _ensure_browser() -> Browser:
             _pw = await async_playwright().start()
             _browser = await _pw.chromium.launch(
                 headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
+                args=_chromium_launch_args(),
             )
         return _browser
 
@@ -147,6 +147,23 @@ DEFAULT_HEADERS = {
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+
+def _chromium_launch_args(*, maximize: bool = False) -> list[str]:
+    """
+    Flags for Chromium in Docker / Railway (no display, often root, small /dev/shm).
+    Without these, headless Chrome can fail with "The platform failed to initialize".
+    """
+    args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+    ]
+    if maximize:
+        args.append("--start-maximized")
+    return args
 
 countries = {
     'AD': 'Andorra',
@@ -639,7 +656,7 @@ def _fetch_html_playwright_sync(url: str, *, navigation_timeout_ms: int = 90_000
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=_chromium_launch_args(),
         )
         context = browser.new_context(**ctx_kwargs)
         page = context.new_page()
@@ -772,7 +789,7 @@ def _run_sync_captcha_flow( start_url: str, *, headless: bool, interactive_promp
     Env ``BOOKFINDER_CAPTCHA_PAUSE_SECONDS`` (e.g. ``5``): seconds to wait before closing the
     CAPTCHA window so you can inspect the page after solve.
     """
-    launch_args: list[str] = [] if headless else ["--start-maximized"]
+    launch_args = _chromium_launch_args(maximize=not headless)
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, args=launch_args)
         context = browser.new_context(no_viewport=True)
@@ -882,11 +899,11 @@ async def scrape_bookfinder(
                 if "confirm you are human" in html.lower():
                     logger.info("reCAPTCHA challenge detected for %s; forcing pass_captcha", isbn)
                     await pass_captcha(isbn, force=True)
-                    await asyncio.sleep(random.uniform(1.5, 2.5))
+                    await asyncio.sleep(random.uniform(2.0, 2.5))
                     html = await _fetch_html_playwright(fetch_url)
                 return await asyncio.to_thread(parse_search_html, html, isbn, filters)
             except BookFinderRateLimited as e:
-                wait = random.uniform(8.0, 14.0)
+                wait = random.uniform(7.0, 14.0)
                 logger.warning(
                     "HTTP 429 rate limited for %s — sleeping %.0fs before retry (attempt %s/%s)",
                     isbn,
