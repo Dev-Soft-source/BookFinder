@@ -29,7 +29,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, EmailStr
 from fastapi.staticfiles import StaticFiles
-from backend.scraper import scrape_bookfinder, send_email_alert, shutdown_playwright, pass_captcha
+from backend.scraper import (
+    scrape_bookfinder,
+    send_email_alert,
+    shutdown_playwright,
+    pass_captcha,
+)
 #from scraper import scrape_bookfinder, send_email_alert, shutdown_playwright, pass_captcha
 
 from sqlalchemy import (
@@ -260,17 +265,47 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 # and async def send_email_alert(email: str, find: ProfitableFindORM)
 
 
+async def _load_banned_filters() -> dict:
+    async with async_session() as session:
+        be_q = await session.execute(select(BannedEntityORM))
+        banned_entities = be_q.scalars().all()
+        return {
+            "sellers": [b.value.lower() for b in banned_entities if b.entity_type == "seller"],
+            "countries": [b.value.lower() for b in banned_entities if b.entity_type == "country"],
+            "websites": [b.value.lower() for b in banned_entities if b.entity_type == "website"],
+        }
+
+
+async def _persist_scraper_checkpoint(isbn: str) -> None:
+    async with async_session() as session:
+        checkpoint_q = await session.execute(
+            select(ScraperCheckpointORM).where(ScraperCheckpointORM.state_key == "isbn_resume")
+        )
+        checkpoint = checkpoint_q.scalars().first()
+        if checkpoint is None:
+            checkpoint = ScraperCheckpointORM(state_key="isbn_resume", last_isbn=isbn)
+            session.add(checkpoint)
+        else:
+            checkpoint.last_isbn = isbn
+            checkpoint.updated_at = datetime.now(timezone.utc)
+        await session.commit()
+
+
+async def _add_scraper_log(log_type: str, message: str, isbn: Optional[str] = None) -> None:
+    async with async_session() as session:
+        session.add(ScraperLogORM(log_type=log_type, message=message, isbn=isbn))
+        await session.commit()
+
+
 async def scraper_task():
     global csv_list, profitable_list # fix UnboundLocalError
-    is_profitable = False
     try:
         async with async_session() as session:
             q = await session.execute(select(ISBNORM))
             isbns = q.scalars().all()
 
             if not isbns:
-                log = ScraperLogORM(log_type="info", message="No ISBN records found in database")
-                session.add(log)
+                session.add(ScraperLogORM(log_type="info", message="No ISBN records found in database"))
                 await session.commit()
                 return
 
@@ -283,7 +318,6 @@ async def scraper_task():
                 session.add(checkpoint)
                 await session.commit()
 
-            # Resume from the next ISBN after the last processed one.
             if checkpoint.last_isbn:
                 last_idx = next(
                     (idx for idx, item in enumerate(isbns) if item.isbn == checkpoint.last_isbn),
@@ -292,62 +326,58 @@ async def scraper_task():
                 if last_idx is not None and len(isbns) > 1:
                     isbns = isbns[last_idx + 1:] + isbns[:last_idx + 1]
 
-            await pass_captcha(isbns[0].isbn)
-            await asyncio.sleep(1.0)  # short pause to ensure CAPTCHA state settles
+            isbn_queue = [item.isbn for item in isbns]
 
-            for isbn_item in isbns:
-                if not scraper_status["running_loop"]:
-                    break
-                 # get banned entities
-                be_q = await session.execute(select(BannedEntityORM))
-                banned_entities = be_q.scalars().all()
-                banned_sellers = [b.value.lower() for b in banned_entities if b.entity_type == "seller"]
-                banned_countries = [b.value.lower() for b in banned_entities if b.entity_type == "country"]
-                banned_websites = [b.value.lower() for b in banned_entities if b.entity_type == "website"]
-                filters = {"sellers": banned_sellers, "countries": banned_countries, "websites": banned_websites}
+        filters = await _load_banned_filters()
 
-                try:
-                    result = await scrape_bookfinder(isbn_item.isbn, filters)
-                    _scrape_human_delay()
+        await pass_captcha(isbn_queue[0])
+        await asyncio.sleep(1.0)  # short pause to ensure CAPTCHA state settles
 
-                    title_text = str(result.get("title") or "").lower()
-                    if RECAPTCHA_TITLE_MARKER in title_text:
-                        warn_msg = f"Captcha page detected for {isbn_item.isbn}; restarting server"
-                        logger.warning(warn_msg)
-                        session.add(ScraperLogORM(log_type="error", message=warn_msg, isbn=isbn_item.isbn))
+        for isbn in isbn_queue:
+            if not scraper_status["running_loop"]:
+                break
+
+            try:
+                result = await scrape_bookfinder(isbn, filters)
+                _scrape_human_delay()
+
+                title_text = str(result.get("title") or "").lower()
+                if RECAPTCHA_TITLE_MARKER in title_text:
+                    warn_msg = f"Captcha page detected for {isbn}; restarting server"
+                    logger.warning(warn_msg)
+                    await _add_scraper_log("error", warn_msg, isbn)
+                    request_server_restart(warn_msg)
+
+                if result.get("buy_price", 0) == 0 and result.get("buyback_price", 0) == 0:
+                    logger.warning(f"No prices found for {isbn}. Retrying once...")
+                    await asyncio.sleep(
+                        float(os.environ.get("BOOKFINDER_EMPTY_RETRY_DELAY", "10"))
+                    )
+                    result = await scrape_bookfinder(isbn, filters)
+
+                if result.get("buy_price", 0) == 0:
+                    continue
+
+                csv_list.append(result)
+                if csv_list and len(csv_list) > len(isbn_queue):
+                    csv_list.pop(0)
+
+                async with async_session() as session:
+                    q = await session.execute(select(ISBNORM).where(ISBNORM.isbn == isbn))
+                    isbn_row = q.scalars().first()
+                    if isbn_row:
+                        isbn_row.last_checked = datetime.now(timezone.utc)
                         await session.commit()
-                        request_server_restart(warn_msg)
 
-                    # Retry once if both prices are 0
-                    if result.get("buy_price", 0) == 0 and result.get("buyback_price", 0) == 0:
-                        logger.warning(f"No prices found for {isbn_item.isbn}. Retrying once...")
-                        await asyncio.sleep(
-                            float(os.environ.get("BOOKFINDER_EMPTY_RETRY_DELAY", "10"))
-                        )
-                        result = await scrape_bookfinder(isbn_item.isbn, filters)
-                    
-                    if result.get("buy_price", 0) == 0:
-                        continue
+                profit_value = result.get("profit", 0.0)
+                if profit_value < 5.0:
+                    continue
 
-                    csv_list.append(result)
-
-                    if csv_list and len(csv_list) > len(isbns):
-                        csv_list.pop(0)
-
-                    # update last_checked
-                    isbn_item.last_checked = datetime.now(timezone.utc)
-                    session.add(isbn_item)
-                    await session.commit()
-
-                    profit_value = result.get("profit", 0.0)
-                    if profit_value < 5.0:
-                        continue
-
-                    if result and result.get("is_profitable"):
-                        is_profitable = True
-                        profitable_list.append(result)
+                if result and result.get("is_profitable"):
+                    profitable_list.append(result)
+                    async with async_session() as session:
                         find = ProfitableFindORM(
-                            isbn=isbn_item.isbn,
+                            isbn=isbn,
                             title=result.get("title"),
                             buy_price=result.get("buy_price", 0.0),
                             buyback_price=result.get("buyback_price", 0.0),
@@ -359,53 +389,39 @@ async def scraper_task():
                             condition=result.get("condition"),
                         )
                         session.add(find)
+                        session.add(
+                            ScraperLogORM(
+                                log_type="success",
+                                message=f"Profitable find: ${profit_value}",
+                                isbn=isbn,
+                            )
+                        )
                         await session.commit()
 
+                    admin_email = os.environ.get("ADMIN_EMAIL")
+                    if admin_email:
+                        try:
+                            await send_email_alert(admin_email, profitable_list)
+                        except Exception as e:
+                            logger.exception("Failed to send email alert: %s", e)
+                        profitable_list.clear()
+                else:
+                    await _add_scraper_log("info", "Not profitable or missing data", isbn)
+            except Exception as e:
+                _scrape_human_delay()
+                error_msg = f"Error scraping {isbn}: {str(e)}"
+                logger.exception(error_msg)
+                await _add_scraper_log("error", error_msg, isbn)
+            finally:
+                await _persist_scraper_checkpoint(isbn)
 
-                        log = ScraperLogORM(log_type="success", message=f"Profitable find: ${profit_value}", isbn=isbn_item.isbn)
-                        session.add(log)
-                        await session.commit()
-
-                        admin_email = os.environ.get("ADMIN_EMAIL")
-                        if admin_email:
-                            # send email alert (async)
-                            try:
-                                await send_email_alert(admin_email, profitable_list)
-                            except Exception as e:
-                                logger.exception("Failed to send email alert: %s", e)
-                            is_profitable = False
-                            profitable_list.clear()
-                    else:
-                        log = ScraperLogORM(log_type="info", message="Not profitable or missing data", isbn=isbn_item.isbn)
-                        session.add(log)
-                        await session.commit()
-                except Exception as e:
-                    _scrape_human_delay()
-                    error_msg = f"Error scraping {isbn_item.isbn}: {str(e)}"
-                    logger.exception(error_msg)
-                    session.add(ScraperLogORM(log_type="error", message=error_msg, isbn=isbn_item.isbn))
-                    await session.commit()
-                finally:
-                    # Persist progress after each ISBN so restart resumes from next item.
-                    checkpoint.last_isbn = isbn_item.isbn
-                    checkpoint.updated_at = datetime.now(timezone.utc)
-                    session.add(checkpoint)
-                    await session.commit()
-
-                # Add delay between scrapes to avoid rate limits (shared datacenter IPs need more).
-                
-            
-            # final info log
-            info_log = ScraperLogORM(log_type="info", message=f"Completed scraping {len(isbns)} ISBNs")
-            session.add(info_log)
-            await session.commit()
-            print("Scraper task completed")
+        await _add_scraper_log("info", f"Completed scraping {len(isbn_queue)} ISBNs")
+        print("Scraper task completed")
     except Exception as e:
-        async with async_session() as session:
-            log = ScraperLogORM(log_type="error", message=f"Scraper error: {str(e)}")
-            session.add(log)
-            await session.commit()
+        await _add_scraper_log("error", f"Scraper error: {str(e)}")
         logger.exception("Scraper main error: %s", e)
+    finally:
+        await shutdown_playwright()
 
 def _scrape_human_delay() -> None:
     """Pause between ISBNs to reduce 429s (tune with BOOKFINDER_SCRAPE_DELAY_MIN / _MAX)."""
