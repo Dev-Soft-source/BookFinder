@@ -301,11 +301,25 @@ async def scraper_task():
     global csv_list, profitable_list # fix UnboundLocalError
     try:
         async with async_session() as session:
-            q = await session.execute(select(ISBNORM))
+            cooldown_hours = float(os.environ.get("BOOKFINDER_ISBN_COOLDOWN_HOURS", "24"))
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)
+            q = await session.execute(
+                select(ISBNORM).where(
+                    or_(ISBNORM.last_checked.is_(None), ISBNORM.last_checked < cutoff)
+                )
+            )
             isbns = q.scalars().all()
 
             if not isbns:
-                session.add(ScraperLogORM(log_type="info", message="No ISBN records found in database"))
+                session.add(
+                    ScraperLogORM(
+                        log_type="info",
+                        message=(
+                            f"No ISBNs due for checking "
+                            f"(cooldown {cooldown_hours:g}h)"
+                        ),
+                    )
+                )
                 await session.commit()
                 return
 
