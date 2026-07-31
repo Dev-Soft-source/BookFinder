@@ -47,12 +47,12 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "your-secret-key-change-in-production")
-ALGORITHM = "HS256"
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./bookfinder.db")
+# SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+# ALGORITHM = "HS256"
+# DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./bookfinder.db")
 
-BASE_DIR = Path(__file__).resolve().parent
-FRONTEND_BUILD = BASE_DIR.parent / "frontend" / "build"
+# BASE_DIR = Path(__file__).resolve().parent
+# FRONTEND_BUILD = BASE_DIR.parent / "frontend" / "build"
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -77,72 +77,72 @@ def generate_uuid() -> str:
     return str(uuid.uuid4())
 
 
-def request_server_restart(reason: str) -> None:
-    """
-    Restart the current process once (used for hard captcha recovery).
-    """
-    if restart_state["requested"]:
-        return
-    restart_state["requested"] = True
-    logger.error("Server restart requested: %s", reason)
-    python = sys.executable
-    os.execv(python, [python] + sys.argv)
+# def request_server_restart(reason: str) -> None:
+#     """
+#     Restart the current process once (used for hard captcha recovery).
+#     """
+#     if restart_state["requested"]:
+#         return
+#     restart_state["requested"] = True
+#     logger.error("Server restart requested: %s", reason)
+#     python = sys.executable
+#     os.execv(python, [python] + sys.argv)
 
-class UserORM(Base):
-    __tablename__ = "users"
-    id = Column(String, primary_key=True, default=generate_uuid)
-    email = Column(String, unique=True, nullable=False)
-    hashed_password = Column(String, nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+# class UserORM(Base):
+#     __tablename__ = "users"
+#     id = Column(String, primary_key=True, default=generate_uuid)
+#     email = Column(String, unique=True, nullable=False)
+#     hashed_password = Column(String, nullable=False)
+#     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-class ISBNORM(Base):
-    __tablename__ = "isbns"
+# class ISBNORM(Base):
+#     __tablename__ = "isbns"
 
-    id = Column(String, primary_key=True, default=generate_uuid)
-    isbn = Column(String, unique=True, nullable=False)
-    added_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    last_checked = Column(DateTime, nullable=True)
+#     id = Column(String, primary_key=True, default=generate_uuid)
+#     isbn = Column(String, unique=True, nullable=False)
+#     added_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+#     last_checked = Column(DateTime, nullable=True)
 
-    def __repr__(self):
-        return f"<ISBNORM(id={self.id}, isbn='{self.isbn}', last_checked={self.last_checked})>"
+#     def __repr__(self):
+#         return f"<ISBNORM(id={self.id}, isbn='{self.isbn}', last_checked={self.last_checked})>"
 
-class ProfitableFindORM(Base):
-    __tablename__ = "profitable_finds"
-    id = Column(String, primary_key=True, default=generate_uuid)
-    isbn = Column(String)
-    title = Column(String, nullable=True)
-    buy_price = Column(Float)
-    buyback_price = Column(Float)
-    profit = Column(Float)
-    buy_link = Column(String, nullable=True)
-    buyback_link = Column(String, nullable=True)
-    seller_name = Column(String, nullable=True)
-    seller_country = Column(String, nullable=True)
-    condition = Column(String, nullable=True)
-    found_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    notified = Column(Boolean, default=False)
+# class ProfitableFindORM(Base):
+#     __tablename__ = "profitable_finds"
+#     id = Column(String, primary_key=True, default=generate_uuid)
+#     isbn = Column(String)
+#     title = Column(String, nullable=True)
+#     buy_price = Column(Float)
+#     buyback_price = Column(Float)
+#     profit = Column(Float)
+#     buy_link = Column(String, nullable=True)
+#     buyback_link = Column(String, nullable=True)
+#     seller_name = Column(String, nullable=True)
+#     seller_country = Column(String, nullable=True)
+#     condition = Column(String, nullable=True)
+#     found_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+#     notified = Column(Boolean, default=False)
 
-class BannedEntityORM(Base):
-    __tablename__ = "banned_entities"
-    id = Column(String, primary_key=True, default=generate_uuid)
-    entity_type = Column(String, nullable=False)
-    value = Column(String, nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+# class BannedEntityORM(Base):
+#     __tablename__ = "banned_entities"
+#     id = Column(String, primary_key=True, default=generate_uuid)
+#     entity_type = Column(String, nullable=False)
+#     value = Column(String, nullable=False)
+#     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-class ScraperLogORM(Base):
-    __tablename__ = "logs"
-    id = Column(String, primary_key=True, default=generate_uuid)
-    log_type = Column(String)  # 'info', 'error', 'success'
-    message = Column(String)
-    isbn = Column(String, nullable=True)
-    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+# class ScraperLogORM(Base):
+#     __tablename__ = "logs"
+#     id = Column(String, primary_key=True, default=generate_uuid)
+#     log_type = Column(String)  # 'info', 'error', 'success'
+#     message = Column(String)
+#     isbn = Column(String, nullable=True)
+#     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-class ScraperCheckpointORM(Base):
-    __tablename__ = "scraper_checkpoint"
-    id = Column(String, primary_key=True, default=generate_uuid)
-    state_key = Column(String, unique=True, nullable=False)  # e.g. "isbn_resume"
-    last_isbn = Column(String, nullable=True)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+# class ScraperCheckpointORM(Base):
+#     __tablename__ = "scraper_checkpoint"
+#     id = Column(String, primary_key=True, default=generate_uuid)
+#     state_key = Column(String, unique=True, nullable=False)  # e.g. "isbn_resume"
+#     last_isbn = Column(String, nullable=True)
+#     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 # --- Pydantic schemas ---
 class Token(BaseModel):
